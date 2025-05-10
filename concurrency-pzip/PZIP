@@ -1,0 +1,171 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysinfo.h>
+#include <pthread.h>
+#include <stdint.h>
+
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+// A simple RLE result structure
+typedef struct {
+    int count;
+    char c;
+} RLE;
+
+// Arguments for each thread
+typedef struct {
+    char *data;
+    size_t start;
+    size_t end;
+    RLE *results;
+    size_t *result_count;
+    int thread_id;
+} ThreadArg;
+
+// One result buffer per thread (no need for mutex)
+#define MAX_RESULTS_PER_THREAD 1000000
+RLE *thread_results[128];
+size_t thread_result_counts[128];
+
+void *rle_compress(void *arg) {
+    ThreadArg *targ = (ThreadArg *)arg;
+    char *data = targ->data;
+    size_t start = targ->start;
+    size_t end = targ->end;
+
+    RLE *results = thread_results[targ->thread_id];
+    size_t count = 0;
+
+    if (start >= end) {
+        targ->result_count = 0;
+        return NULL;
+    }
+
+    char current = data[start];
+    int run_len = 1;
+
+    for (size_t i = start + 1; i < end; i++) {
+        if (data[i] == current) {
+            run_len++;
+        } else {
+            results[count++] = (RLE){run_len, current};
+            current = data[i];
+            run_len = 1;
+        }
+    }
+    results[count++] = (RLE){run_len, current};
+
+    targ->result_count = &thread_result_counts[targ->thread_id];
+    *(targ->result_count) = count;
+
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s file1 [file2 ...]\n", argv[0]);
+        exit(1);
+    }
+
+    // Concatenate all input files into a single buffer using mmap()
+    int total_fd_size = 0;
+    int *fds = malloc(sizeof(int) * argc);
+    struct stat *stats = malloc(sizeof(struct stat) * argc);
+    char **file_maps = malloc(sizeof(char *) * argc);
+
+    for (int i = 1; i < argc; i++) {
+        fds[i] = open(argv[i], O_RDONLY);
+        if (fds[i] < 0) {
+            perror("open");
+            exit(1);
+        }
+        if (fstat(fds[i], &stats[i]) < 0) {
+            perror("fstat");
+            exit(1);
+        }
+        file_maps[i] = mmap(NULL, stats[i].st_size, PROT_READ, MAP_PRIVATE, fds[i], 0);
+        if (file_maps[i] == MAP_FAILED) {
+            perror("mmap");
+            exit(1);
+        }
+        total_fd_size += stats[i].st_size;
+    }
+
+    // Copy all mmap'd data into one big buffer
+    char *full_data = malloc(total_fd_size);
+    int offset = 0;
+    for (int i = 1; i < argc; i++) {
+        memcpy(full_data + offset, file_maps[i], stats[i].st_size);
+        offset += stats[i].st_size;
+        munmap(file_maps[i], stats[i].st_size);
+        close(fds[i]);
+    }
+
+    free(fds);
+    free(stats);
+    free(file_maps);
+
+    int num_threads = get_nprocs();
+    pthread_t threads[num_threads];
+    ThreadArg args[num_threads];
+
+    size_t chunk_size = total_fd_size / num_threads;
+    for (int i = 0; i < num_threads; i++) {
+        size_t start = i * chunk_size;
+        size_t end = (i == num_threads - 1) ? total_fd_size : (i + 1) * chunk_size;
+
+        // avoid splitting in the middle of a run
+        if (i != num_threads - 1) {
+            while (end < total_fd_size && full_data[end] == full_data[end - 1]) {
+                end++;
+            }
+        }
+
+        thread_results[i] = malloc(sizeof(RLE) * MAX_RESULTS_PER_THREAD);
+
+        args[i] = (ThreadArg){
+            .data = full_data,
+            .start = start,
+            .end = end,
+            .results = thread_results[i],
+            .thread_id = i
+        };
+
+        pthread_create(&threads[i], NULL, rle_compress, &args[i]);
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    // Merge & print
+    RLE prev = {0, 0};
+    for (int i = 0; i < num_threads; i++) {
+        RLE *res = thread_results[i];
+        size_t count = thread_result_counts[i];
+        for (size_t j = 0; j < count; j++) {
+            if (prev.count > 0 && res[j].c == prev.c) {
+                prev.count += res[j].count;
+            } else {
+                if (prev.count > 0) {
+                    fwrite(&prev.count, sizeof(int), 1, stdout);
+                    fwrite(&prev.c, sizeof(char), 1, stdout);
+                }
+                prev = res[j];
+            }
+        }
+        free(res);
+    }
+    if (prev.count > 0) {
+        fwrite(&prev.count, sizeof(int), 1, stdout);
+        fwrite(&prev.c, sizeof(char), 1, stdout);
+    }
+
+    free(full_data);
+    return 0;
+}
